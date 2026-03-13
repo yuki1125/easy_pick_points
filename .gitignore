@@ -1,0 +1,27 @@
+# Python cache and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local runtime and generated outputs
+.runtime/
+outputs/
+sample_data/
+
+# Coverage and logs
+.coverage
+htmlcov/
+*.log
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
