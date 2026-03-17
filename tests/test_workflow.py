@@ -22,8 +22,10 @@ class WorkflowTest(unittest.TestCase):
                 cloud = load_point_cloud(path)
                 expected = generated[path.name]
                 self.assertEqual(cloud.points.shape[1], 3)
+                self.assertIsNotNone(cloud.intensities)
                 self.assertGreater(cloud.points.shape[0], 0)
-                np.testing.assert_allclose(cloud.points, expected, atol=1e-5)
+                np.testing.assert_allclose(cloud.points, expected[:, :3], atol=1e-5)
+                np.testing.assert_allclose(cloud.intensities, expected[:, 3], atol=1e-5)
 
     def test_select_nearest_point_uses_slice_filter(self) -> None:
         points = np.array(
@@ -45,9 +47,14 @@ class WorkflowTest(unittest.TestCase):
             session.add_selection(0)
             saved = session.save_current("picked")
             self.assertTrue(saved.exists())
-            with saved.open("r", encoding="utf-8") as handle:
+            self.assertEqual(saved.suffix, ".npy")
+            saved_array = np.load(saved)
+            self.assertEqual(saved_array.shape, (1, 4))
+            csv_sidecar = saved.with_suffix(".csv")
+            self.assertTrue(csv_sidecar.exists())
+            with csv_sidecar.open("r", encoding="utf-8") as handle:
                 rows = list(csv.reader(handle))
-            self.assertEqual(rows[0], ["x", "y", "z"])
+            self.assertEqual(rows[0], ["x", "y", "z", "ref"])
             self.assertEqual(len(rows), 2)
             self.assertTrue(session.advance())
             self.assertEqual(Path(session.current_path), Path(sample_paths[1]))
@@ -66,11 +73,14 @@ class WorkflowTest(unittest.TestCase):
 
     def test_save_selected_points_allows_empty_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            output = save_selected_points(Path(tmpdir) / "dummy.npy", np.empty((0, 3)), "none", output_dir=tmpdir)
+            output = save_selected_points(Path(tmpdir) / "dummy.npy", np.empty((0, 4)), "none", output_dir=tmpdir)
             self.assertTrue(output.exists())
-            with output.open("r", encoding="utf-8") as handle:
+            self.assertEqual(output.suffix, ".npy")
+            saved = np.load(output)
+            self.assertEqual(saved.shape, (0, 4))
+            with output.with_suffix(".csv").open("r", encoding="utf-8") as handle:
                 lines = [line.strip() for line in handle]
-            self.assertEqual(lines, ["x,y,z"])
+            self.assertEqual(lines, ["x,y,z,ref"])
 
 
 if __name__ == "__main__":

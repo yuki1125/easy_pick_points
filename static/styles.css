@@ -293,6 +293,12 @@ input {
   font-size: 0.88rem;
 }
 
+.range-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
 .button-stack {
   display: grid;
   gap: 10px;
@@ -346,6 +352,11 @@ input[type="text"] {
   border-radius: 12px;
   color: var(--text);
   background: rgba(255, 255, 255, 0.04);
+}
+
+input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent);
 }
 
 .download-link {

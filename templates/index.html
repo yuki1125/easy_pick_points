@@ -76,6 +76,21 @@
         <aside class="sidebar">
           <section class="panel">
             <div class="panel-head">
+              <h3>Display</h3>
+              <span id="intensityModeBadge" class="badge">単色</span>
+            </div>
+            <label class="field">
+              <span>点群サイズ</span>
+              <div class="range-row">
+                <input id="pointSizeSlider" type="range" min="0.4" max="3.0" step="0.05" value="1.0">
+                <span id="pointSizeValue" class="badge">1.00x</span>
+              </div>
+            </label>
+            <p class="help-text">反射強度がある点群は ref に応じた配色で表示されます。スライダーは表示サイズのみ変更し、元データは変えません。</p>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
               <h3>Marker</h3>
               <span id="markerStateBadge" class="badge">未配置</span>
             </div>

@@ -115,7 +115,8 @@ def create_app(
         point = payload.get("point")
         if point is None:
             raise ValueError("point is required")
-        state.selection_session.add_selected_point(point)
+        intensity = payload.get("intensity")
+        state.selection_session.add_selected_point(point, intensity=intensity)
         return jsonify(
             {
                 "message": "マーカー座標を追加しました。",
@@ -243,14 +244,10 @@ def _serialize_state(state: BrowserSessionState) -> dict[str, Any]:
             "fileCount": len(selection.file_paths),
             "fileQueue": [path.name for path in selection.file_paths],
             "pointCount": int(len(points)),
+            "hasIntensity": cloud.has_intensity,
+            "intensityRange": _serialize_intensity_range(cloud.intensities),
             "selectedCount": len(selection.current_selections),
-            "selectedPoints": [
-                {
-                    "ordinal": index + 1,
-                    "xyz": _round_point(point),
-                }
-                for index, point in enumerate(selection.current_selections)
-            ],
+            "selectedPoints": [_serialize_selected_point(index, point) for index, point in enumerate(selection.current_selections)],
             "bounds": {
                 axis_name: {"min": float(minimum), "max": float(maximum)}
                 for axis_name, minimum, maximum in zip(AXIS_NAMES, minima, maxima)
@@ -270,6 +267,9 @@ def _serialize_cloud(selection: SelectionSession) -> dict[str, Any]:
         "currentFile": cloud.name,
         "pointCount": int(len(points)),
         "points": _round_points(points),
+        "intensities": _round_values(cloud.intensities),
+        "hasIntensity": cloud.has_intensity,
+        "intensityRange": _serialize_intensity_range(cloud.intensities),
         "bounds": {
             axis_name: {"min": float(minimum), "max": float(maximum)}
             for axis_name, minimum, maximum in zip(AXIS_NAMES, minima, maxima)
@@ -296,9 +296,39 @@ def _round_points(points: np.ndarray) -> list[list[float]]:
     return np.round(points.astype(float), 5).tolist()
 
 
+def _round_values(values: np.ndarray | None) -> list[float] | None:
+    if values is None:
+        return None
+    if len(values) == 0:
+        return []
+    return np.round(np.asarray(values, dtype=float), 5).tolist()
+
+
 def _round_point(point: np.ndarray | list[float]) -> list[float]:
     values = np.asarray(point, dtype=float).reshape(-1)
     return [round(float(values[0]), 5), round(float(values[1]), 5), round(float(values[2]), 5)]
+
+
+def _serialize_selected_point(index: int, point: np.ndarray | list[float]) -> dict[str, Any]:
+    values = np.asarray(point, dtype=float).reshape(-1)
+    payload: dict[str, Any] = {
+        "ordinal": index + 1,
+        "xyz": _round_point(values[:3]),
+        "ref": None,
+    }
+    if values.size >= 4 and np.isfinite(values[3]):
+        payload["ref"] = round(float(values[3]), 5)
+    return payload
+
+
+def _serialize_intensity_range(intensities: np.ndarray | None) -> dict[str, float] | None:
+    if intensities is None:
+        return None
+    values = np.asarray(intensities, dtype=float)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return None
+    return {"min": float(np.min(finite)), "max": float(np.max(finite))}
 
 
 def main() -> None:

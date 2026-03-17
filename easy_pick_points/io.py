@@ -10,16 +10,22 @@ import numpy as np
 
 
 SUPPORTED_EXTENSIONS = {".npy", ".csv", ".pts", ".pcd"}
+INTENSITY_FIELD_NAMES = ("ref", "intensity", "reflectance")
 
 
 @dataclass(slots=True)
 class PointCloud:
     path: Path
     points: np.ndarray
+    intensities: np.ndarray | None = None
 
     @property
     def name(self) -> str:
         return self.path.name
+
+    @property
+    def has_intensity(self) -> bool:
+        return self.intensities is not None
 
 
 def load_point_cloud(path: str | Path) -> PointCloud:
@@ -29,22 +35,22 @@ def load_point_cloud(path: str | Path) -> PointCloud:
         raise ValueError(f"Unsupported point cloud format: {source.suffix}")
 
     if extension == ".npy":
-        points = _load_npy(source)
+        points, intensities = _load_npy(source)
     elif extension == ".csv":
-        points = _load_csv(source)
+        points, intensities = _load_csv(source)
     elif extension == ".pts":
-        points = _load_pts(source)
+        points, intensities = _load_pts(source)
     else:
-        points = _load_pcd(source)
+        points, intensities = _load_pcd(source)
 
-    return PointCloud(path=source, points=_ensure_xyz(points, source))
-
-
-def _load_npy(path: Path) -> np.ndarray:
-    return np.asarray(np.load(path), dtype=float)
+    return PointCloud(path=source, points=points, intensities=intensities)
 
 
-def _load_csv(path: Path) -> np.ndarray:
+def _load_npy(path: Path) -> tuple[np.ndarray, np.ndarray | None]:
+    return _split_array_columns(np.asarray(np.load(path), dtype=float), path)
+
+
+def _load_csv(path: Path) -> tuple[np.ndarray, np.ndarray | None]:
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.reader(handle)
         rows = [row for row in reader if row]
@@ -57,23 +63,37 @@ def _load_csv(path: Path) -> np.ndarray:
     data_rows = rows[1:] if named_columns else rows
 
     points: list[list[float]] = []
+    intensities: list[float] | None = None
+
     if named_columns:
-        indices = [header.index(axis) for axis in ("x", "y", "z")]
+        xyz_indices = [header.index(axis) for axis in ("x", "y", "z")]
+        intensity_index = _find_intensity_index(header)
+        if intensity_index is not None:
+            intensities = []
         for row in data_rows:
-            if len(row) <= max(indices):
+            if len(row) <= max(xyz_indices):
                 continue
-            points.append([float(row[index]) for index in indices])
+            points.append([float(row[index]) for index in xyz_indices])
+            if intensity_index is not None:
+                intensities.append(_parse_optional_float(row, intensity_index))
     else:
         for row in data_rows:
-            numeric = _extract_numeric_prefix(row, count=3)
-            if numeric is not None:
-                points.append(numeric)
+            parsed = _extract_point_and_intensity(row)
+            if parsed is None:
+                continue
+            xyz, intensity = parsed
+            points.append(xyz)
+            if intensity is not None or intensities is not None:
+                if intensities is None:
+                    intensities = [np.nan] * (len(points) - 1)
+                intensities.append(np.nan if intensity is None else intensity)
 
-    return np.asarray(points, dtype=float)
+    return _assemble_point_cloud(points, intensities)
 
 
-def _load_pts(path: Path) -> np.ndarray:
+def _load_pts(path: Path) -> tuple[np.ndarray, np.ndarray | None]:
     points: list[list[float]] = []
+    intensities: list[float] | None = None
     with path.open("r", encoding="utf-8") as handle:
         lines = [line.strip() for line in handle if line.strip()]
 
@@ -82,13 +102,19 @@ def _load_pts(path: Path) -> np.ndarray:
 
     start_index = 1 if _looks_like_point_count(lines[0]) else 0
     for line in lines[start_index:]:
-        values = _extract_numeric_prefix(line.split(), count=3)
-        if values is not None:
-            points.append(values)
-    return np.asarray(points, dtype=float)
+        parsed = _extract_point_and_intensity(line.split())
+        if parsed is None:
+            continue
+        xyz, intensity = parsed
+        points.append(xyz)
+        if intensity is not None or intensities is not None:
+            if intensities is None:
+                intensities = [np.nan] * (len(points) - 1)
+            intensities.append(np.nan if intensity is None else intensity)
+    return _assemble_point_cloud(points, intensities)
 
 
-def _load_pcd(path: Path) -> np.ndarray:
+def _load_pcd(path: Path) -> tuple[np.ndarray, np.ndarray | None]:
     with path.open("rb") as handle:
         raw = handle.read()
 
@@ -100,9 +126,9 @@ def _load_pcd(path: Path) -> np.ndarray:
         text = data.decode("ascii", errors="strict").strip()
         rows = np.loadtxt(io.StringIO(text)) if text else np.empty((0, len(header["fields"])))
         rows = np.atleast_2d(rows)
-        return _extract_xyz_from_ascii_rows(rows, header["fields"])
+        return _extract_cloud_from_ascii_rows(rows, header["fields"])
     if data_mode == "binary":
-        return _extract_xyz_from_binary_rows(data, header)
+        return _extract_cloud_from_binary_rows(data, header)
     raise ValueError(f"Unsupported PCD DATA mode: {header['data']}")
 
 
@@ -146,18 +172,24 @@ def _parse_pcd_header(text: str) -> dict[str, object]:
     return header
 
 
-def _extract_xyz_from_ascii_rows(rows: np.ndarray, fields: Iterable[str]) -> np.ndarray:
+def _extract_cloud_from_ascii_rows(rows: np.ndarray, fields: Iterable[str]) -> tuple[np.ndarray, np.ndarray | None]:
     field_positions = {name: index for index, name in enumerate(fields)}
-    return np.column_stack(
+    points = np.column_stack(
         [
             rows[:, field_positions["x"]],
             rows[:, field_positions["y"]],
             rows[:, field_positions["z"]],
         ]
-    )
+    ).astype(float, copy=False)
+
+    intensity_field = _find_intensity_field(fields)
+    if intensity_field is None:
+        return points, None
+    intensities = np.asarray(rows[:, field_positions[intensity_field]], dtype=float)
+    return points, np.ascontiguousarray(intensities, dtype=float)
 
 
-def _extract_xyz_from_binary_rows(data: bytes, header: dict[str, object]) -> np.ndarray:
+def _extract_cloud_from_binary_rows(data: bytes, header: dict[str, object]) -> tuple[np.ndarray, np.ndarray | None]:
     fields = list(header["fields"])
     sizes = list(header["size"])
     types = list(header["type"])
@@ -176,7 +208,13 @@ def _extract_xyz_from_binary_rows(data: bytes, header: dict[str, object]) -> np.
     if len(data) < expected_size:
         raise ValueError("PCD binary payload is shorter than expected")
     rows = np.frombuffer(data[:expected_size], dtype=dtype, count=points)
-    return np.column_stack([rows["x"], rows["y"], rows["z"]]).astype(float, copy=False)
+    xyz = np.column_stack([rows["x"], rows["y"], rows["z"]]).astype(float, copy=False)
+
+    intensity_field = _find_intensity_field(fields)
+    if intensity_field is None:
+        return xyz, None
+    values = np.asarray(rows[intensity_field], dtype=float).reshape(points, -1)[:, 0]
+    return xyz, np.ascontiguousarray(values, dtype=float)
 
 
 def _pcd_scalar_dtype(type_code: str, size: int) -> str:
@@ -199,13 +237,57 @@ def _pcd_scalar_dtype(type_code: str, size: int) -> str:
         raise ValueError(f"Unsupported PCD TYPE/SIZE combination: {key}") from exc
 
 
-def _ensure_xyz(points: np.ndarray, path: Path) -> np.ndarray:
-    array = np.asarray(points, dtype=float)
-    if array.size == 0:
-        return np.empty((0, 3), dtype=float)
-    if array.ndim != 2 or array.shape[1] < 3:
+def _split_array_columns(array: np.ndarray, path: Path) -> tuple[np.ndarray, np.ndarray | None]:
+    values = np.asarray(array, dtype=float)
+    if values.ndim == 1:
+        if values.size == 0:
+            return np.empty((0, 3), dtype=float), None
+        values = values.reshape(1, -1)
+    if values.size == 0:
+        if values.ndim == 2 and values.shape[1] >= 4:
+            return np.empty((0, 3), dtype=float), np.empty((0,), dtype=float)
+        return np.empty((0, 3), dtype=float), None
+    if values.ndim != 2 or values.shape[1] < 3:
         raise ValueError(f"Point cloud must be a 2D array with at least 3 columns: {path}")
-    return np.ascontiguousarray(array[:, :3], dtype=float)
+
+    points = np.ascontiguousarray(values[:, :3], dtype=float)
+    if values.shape[1] < 4:
+        return points, None
+    intensities = np.ascontiguousarray(values[:, 3], dtype=float)
+    return points, intensities
+
+
+def _assemble_point_cloud(points: list[list[float]], intensities: list[float] | None) -> tuple[np.ndarray, np.ndarray | None]:
+    xyz = np.asarray(points, dtype=float)
+    if xyz.size == 0:
+        xyz = np.empty((0, 3), dtype=float)
+    elif xyz.ndim != 2 or xyz.shape[1] != 3:
+        raise ValueError("Parsed point cloud must contain x, y and z coordinates")
+
+    if intensities is None:
+        return np.ascontiguousarray(xyz, dtype=float), None
+
+    intensity_array = np.asarray(intensities, dtype=float)
+    if intensity_array.size != len(xyz):
+        raise ValueError("Point/intensity row counts do not match")
+    if intensity_array.size > 0 and not np.isfinite(intensity_array).any():
+        return np.ascontiguousarray(xyz, dtype=float), None
+    return np.ascontiguousarray(xyz, dtype=float), np.ascontiguousarray(intensity_array, dtype=float)
+
+
+def _find_intensity_field(fields: Iterable[str]) -> str | None:
+    field_positions = {name.lower(): name for name in fields}
+    for candidate in INTENSITY_FIELD_NAMES:
+        if candidate in field_positions:
+            return field_positions[candidate]
+    return None
+
+
+def _find_intensity_index(header: list[str]) -> int | None:
+    for candidate in INTENSITY_FIELD_NAMES:
+        if candidate in header:
+            return header.index(candidate)
+    return None
 
 
 def _looks_like_point_count(line: str) -> bool:
@@ -216,13 +298,27 @@ def _looks_like_point_count(line: str) -> bool:
     return value >= 0
 
 
-def _extract_numeric_prefix(values: list[str], count: int) -> list[float] | None:
-    if len(values) < count:
+def _extract_point_and_intensity(values: list[str]) -> tuple[list[float], float | None] | None:
+    if len(values) < 3:
         return None
-    extracted: list[float] = []
-    for value in values[:count]:
+    try:
+        xyz = [float(values[0]), float(values[1]), float(values[2])]
+    except ValueError:
+        return None
+
+    intensity: float | None = None
+    if len(values) >= 4:
         try:
-            extracted.append(float(value))
+            intensity = float(values[3])
         except ValueError:
-            return None
-    return extracted
+            intensity = None
+    return xyz, intensity
+
+
+def _parse_optional_float(row: list[str], index: int) -> float:
+    if index >= len(row):
+        return float("nan")
+    try:
+        return float(row[index])
+    except ValueError:
+        return float("nan")

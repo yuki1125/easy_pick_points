@@ -18,12 +18,15 @@ const state = {
   bounds: null,
   lastSavedFile: null,
   markerPlaced: false,
+  markerIntensity: null,
   moveMode: false,
   lockedAxes: new Set(),
   moveOrigin: null,
   pointerInside: false,
   snapToPoint: true,
   cloudScale: 1,
+  pointSizeScale: 1.0,
+  pointBaseSize: 0.05,
 };
 
 const scene = new THREE.Scene();
@@ -86,6 +89,7 @@ document.addEventListener("DOMContentLoaded", () => {
   initializeViewport();
   bindEvents();
   updateMarkerUi();
+  updatePointSizeUi();
   updateDownloadLink();
   loadState().catch(handleError);
   animate();
@@ -103,9 +107,12 @@ function cacheRefs() {
   refs.statusMessage = document.getElementById("statusMessage");
   refs.markerStateBadge = document.getElementById("markerStateBadge");
   refs.constraintBadge = document.getElementById("constraintBadge");
+  refs.intensityModeBadge = document.getElementById("intensityModeBadge");
   refs.markerX = document.getElementById("markerX");
   refs.markerY = document.getElementById("markerY");
   refs.markerZ = document.getElementById("markerZ");
+  refs.pointSizeSlider = document.getElementById("pointSizeSlider");
+  refs.pointSizeValue = document.getElementById("pointSizeValue");
   refs.placeMarkerButton = document.getElementById("placeMarkerButton");
   refs.moveMarkerButton = document.getElementById("moveMarkerButton");
   refs.addSelectionButton = document.getElementById("addSelectionButton");
@@ -170,6 +177,12 @@ function bindEvents() {
 
   refs.snapToggle.addEventListener("change", (event) => {
     state.snapToPoint = Boolean(event.target.checked);
+  });
+
+  refs.pointSizeSlider.addEventListener("input", (event) => {
+    state.pointSizeScale = Number(event.target.value) || 1.0;
+    updatePointSizeUi();
+    updatePointCloudSize();
   });
 
   [refs.markerX, refs.markerY, refs.markerZ].forEach((input) => {
@@ -310,6 +323,7 @@ function renderMeta() {
   refs.selectionCountMetric.textContent = loaded ? meta.selectedCount : "0";
   refs.selectionCountBadge.textContent = loaded ? `${meta.selectedCount} 点` : "0 点";
   refs.outputDirBadge.textContent = meta?.outputDirectory || "outputs/";
+  refs.intensityModeBadge.textContent = loaded && meta?.hasIntensity ? "Ref配色" : "単色";
   refs.statusMessage.textContent = meta?.message || "ファイルを読み込んでください。";
 
   refs.selectionList.innerHTML = "";
@@ -317,7 +331,8 @@ function renderMeta() {
     meta.selectedPoints.forEach((item) => {
       const li = document.createElement("li");
       const [x, y, z] = item.xyz;
-      li.textContent = `${item.ordinal}. ${x.toFixed(3)}, ${y.toFixed(3)}, ${z.toFixed(3)}`;
+      const refText = item.ref == null ? "" : ` | ref ${Number(item.ref).toFixed(3)}`;
+      li.textContent = `${item.ordinal}. ${x.toFixed(3)}, ${y.toFixed(3)}, ${z.toFixed(3)}${refText}`;
       refs.selectionList.appendChild(li);
     });
   }
@@ -344,9 +359,16 @@ function updateSceneFromCloud(payload, options = {}) {
   const points = payload.points.flat();
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.Float32BufferAttribute(points, 3));
-  pointCloudObject = new THREE.Points(geometry, pointMaterial.clone());
+  const material = pointMaterial.clone();
+  if (payload.hasIntensity && Array.isArray(payload.intensities)) {
+    geometry.setAttribute("color", new THREE.Float32BufferAttribute(buildIntensityColors(payload.intensities), 3));
+    material.vertexColors = true;
+    material.color.set(0xffffff);
+  }
+  pointCloudObject = new THREE.Points(geometry, material);
   state.cloudScale = computeCloudScale(payload.bounds);
-  pointCloudObject.material.size = Math.max(state.cloudScale * 0.018, 0.02);
+  state.pointBaseSize = Math.max(state.cloudScale * 0.018, 0.02);
+  updatePointCloudSize();
   scene.add(pointCloudObject);
 
   raycaster.params.Points.threshold = Math.max(state.cloudScale * 0.06, 0.04);
@@ -364,6 +386,7 @@ function clearViewport() {
   state.cloud = null;
   state.bounds = null;
   state.markerPlaced = false;
+  state.markerIntensity = null;
   markerGroup.visible = false;
   movementPlane.visible = false;
   exitMoveMode({ keepMarker: false, resetConstraint: true });
@@ -508,9 +531,9 @@ function buildMarkerGroup() {
 function onPointerMove(event) {
   updatePointerNdc(event);
   if (state.moveMode && state.markerPlaced) {
-    const position = computeCursorWorldPosition();
-    if (position) {
-      setMarkerPosition(position);
+    const target = computeCursorWorldTarget();
+    if (target) {
+      setMarkerPosition(target.position, target.intensity);
     }
   }
 }
@@ -522,12 +545,12 @@ function updatePointerNdc(event) {
 }
 
 function placeMarkerAtCursor() {
-  const position = computeCursorWorldPosition();
-  if (!position) {
+  const target = computeCursorWorldTarget();
+  if (!target) {
     setStatus("カーソル位置から座標を求められませんでした。");
     return;
   }
-  setMarkerPosition(position);
+  setMarkerPosition(target.position, target.intensity);
   exitMoveMode({ keepMarker: true, resetConstraint: false });
   setStatus("マーカーを配置しました。必要なら G で移動してください。");
 }
@@ -540,7 +563,10 @@ function startMoveMode() {
     }
   }
   state.moveMode = true;
-  state.moveOrigin = markerGroup.position.clone();
+  state.moveOrigin = {
+    position: markerGroup.position.clone(),
+    intensity: state.markerIntensity,
+  };
   controls.enabled = false;
   updateMovementPlane();
   updateMarkerUi();
@@ -549,7 +575,7 @@ function startMoveMode() {
 
 function cancelMoveMode() {
   if (state.moveMode && state.moveOrigin) {
-    setMarkerPosition(state.moveOrigin);
+    setMarkerPosition(state.moveOrigin.position, state.moveOrigin.intensity);
   }
   exitMoveMode({ keepMarker: state.markerPlaced, resetConstraint: false });
   setStatus("移動モードを終了しました。");
@@ -565,6 +591,7 @@ function exitMoveMode({ keepMarker, resetConstraint }) {
   }
   if (!keepMarker) {
     state.markerPlaced = false;
+    state.markerIntensity = null;
     markerGroup.visible = false;
   }
   updateMarkerUi();
@@ -595,11 +622,16 @@ function toggleAxisLock(axis) {
 }
 
 function computeCursorWorldPosition() {
+  const target = computeCursorWorldTarget();
+  return target ? target.position : null;
+}
+
+function computeCursorWorldTarget() {
   if (!state.pointerInside) {
     return null;
   }
   if (state.lockedAxes.size >= 3) {
-    return markerGroup.position.clone();
+    return { position: markerGroup.position.clone(), intensity: state.markerIntensity };
   }
   raycaster.setFromCamera(pointerNdc, camera);
 
@@ -616,11 +648,11 @@ function computeCursorWorldPosition() {
   if (state.lockedAxes.size === 2) {
     const line = getActiveLine();
     if (!line) {
-      return markerGroup.position.clone();
+      return { position: markerGroup.position.clone(), intensity: state.markerIntensity };
     }
-    return projectPointToLine(hit, line);
+    return { position: projectPointToLine(hit, line), intensity: null };
   }
-  return hit;
+  return { position: hit, intensity: null };
 }
 
 function trySnapToPoint() {
@@ -633,7 +665,11 @@ function trySnapToPoint() {
   }
   const index = intersections[0].index;
   const position = pointCloudObject.geometry.getAttribute("position");
-  return new THREE.Vector3(position.getX(index), position.getY(index), position.getZ(index));
+  const intensity = Array.isArray(state.cloud?.intensities) ? state.cloud.intensities[index] : null;
+  return {
+    position: new THREE.Vector3(position.getX(index), position.getY(index), position.getZ(index)),
+    intensity: Number.isFinite(intensity) ? intensity : null,
+  };
 }
 
 function getActivePlane() {
@@ -680,10 +716,11 @@ function updateMovementPlane() {
   movementPlane.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), normal);
 }
 
-function setMarkerPosition(position) {
+function setMarkerPosition(position, intensity = null) {
   markerGroup.position.copy(position);
   markerGroup.visible = true;
   state.markerPlaced = true;
+  state.markerIntensity = Number.isFinite(intensity) ? intensity : null;
   updateMovementPlane();
   setMarkerInputs(position);
   updateMarkerUi();
@@ -694,7 +731,7 @@ function setMarkerFromInputs() {
   if (values.some((value) => Number.isNaN(value))) {
     return;
   }
-  setMarkerPosition(new THREE.Vector3(values[0], values[1], values[2]));
+  setMarkerPosition(new THREE.Vector3(values[0], values[1], values[2]), null);
 }
 
 async function confirmMarkerSelection() {
@@ -705,7 +742,10 @@ async function confirmMarkerSelection() {
   const payload = await fetchJSON("/api/add-selection", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ point: markerGroup.position.toArray() }),
+    body: JSON.stringify({
+      point: markerGroup.position.toArray(),
+      intensity: state.markerIntensity,
+    }),
   });
   await applyState(payload.state, { refreshCloud: true });
   setStatus(payload.message);
@@ -743,6 +783,55 @@ function computeCloudScale(bounds) {
   const spanY = bounds.y.max - bounds.y.min;
   const spanZ = bounds.z.max - bounds.z.min;
   return Math.max(spanX, spanY, spanZ, 1);
+}
+
+function updatePointCloudSize() {
+  if (!pointCloudObject) {
+    return;
+  }
+  pointCloudObject.material.size = state.pointBaseSize * state.pointSizeScale;
+}
+
+function updatePointSizeUi() {
+  if (!refs.pointSizeSlider || !refs.pointSizeValue) {
+    return;
+  }
+  refs.pointSizeSlider.value = state.pointSizeScale.toFixed(2);
+  refs.pointSizeValue.textContent = `${state.pointSizeScale.toFixed(2)}x`;
+}
+
+function buildIntensityColors(intensities) {
+  const values = intensities.map((value) => Number(value));
+  let minValue = Infinity;
+  let maxValue = -Infinity;
+  values.forEach((value) => {
+    if (!Number.isFinite(value)) {
+      return;
+    }
+    if (value < minValue) {
+      minValue = value;
+    }
+    if (value > maxValue) {
+      maxValue = value;
+    }
+  });
+  if (!Number.isFinite(minValue) || !Number.isFinite(maxValue)) {
+    minValue = 0;
+    maxValue = 1;
+  }
+  const span = Math.max(maxValue - minValue, 1e-6);
+  const colors = new Float32Array(values.length * 3);
+  const color = new THREE.Color();
+
+  values.forEach((value, index) => {
+    const normalized = Number.isFinite(value) ? (value - minValue) / span : 0.0;
+    color.setHSL(0.64 - normalized * 0.56, 0.9, 0.55);
+    colors[index * 3] = color.r;
+    colors[index * 3 + 1] = color.g;
+    colors[index * 3 + 2] = color.b;
+  });
+
+  return colors;
 }
 
 function setCameraInteractionMode(shiftPressed) {
