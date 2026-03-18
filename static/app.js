@@ -5,7 +5,11 @@ const refs = {};
 const raycaster = new THREE.Raycaster();
 const pointerNdc = new THREE.Vector2();
 const tmpVector = new THREE.Vector3();
+const tmpQuaternion = new THREE.Quaternion();
 const MARKER_BASE_RADIUS = 0.06;
+const POINT_SIZE_BASE_MULTIPLIER = 0.0018;
+const POINT_SIZE_MIN_WORLD = 0.002;
+const MARKER_SIZE_MULTIPLIER = 4;
 const axisVectors = {
   x: new THREE.Vector3(1, 0, 0),
   y: new THREE.Vector3(0, 1, 0),
@@ -26,7 +30,8 @@ const state = {
   snapToPoint: true,
   cloudScale: 1,
   pointSizeScale: 1.0,
-  pointBaseSize: 0.05,
+  pointBaseSize: POINT_SIZE_MIN_WORLD,
+  rollInteraction: null,
 };
 
 const scene = new THREE.Scene();
@@ -43,7 +48,7 @@ controls.rotateSpeed = 4.0;
 controls.zoomSpeed = 1.4;
 controls.panSpeed = 0.9;
 controls.dynamicDampingFactor = 0.12;
-setCameraInteractionMode(false);
+syncCameraInteractionMode();
 
 const ambientLight = new THREE.AmbientLight(0xffffff, 0.85);
 scene.add(ambientLight);
@@ -238,6 +243,10 @@ function bindDropZone() {
 }
 
 function bindPointerEvents() {
+  renderer.domElement.addEventListener("pointerdown", handleViewportPointerDown, true);
+  renderer.domElement.addEventListener("pointerup", syncCameraInteractionMode, true);
+  renderer.domElement.addEventListener("pointercancel", syncCameraInteractionMode, true);
+  renderer.domElement.addEventListener("wheel", updatePointerNdc);
   renderer.domElement.addEventListener("mousemove", onPointerMove);
   renderer.domElement.addEventListener("mouseenter", () => {
     state.pointerInside = true;
@@ -249,9 +258,7 @@ function bindPointerEvents() {
 
 function bindKeyboardShortcuts() {
   window.addEventListener("keydown", async (event) => {
-    if (event.key === "Shift") {
-      setCameraInteractionMode(true);
-    }
+    syncCameraInteractionMode(event);
     if (event.target instanceof HTMLInputElement) {
       return;
     }
@@ -275,13 +282,12 @@ function bindKeyboardShortcuts() {
   });
 
   window.addEventListener("keyup", (event) => {
-    if (event.key === "Shift") {
-      setCameraInteractionMode(false);
-    }
+    syncCameraInteractionMode(event);
   });
 
   window.addEventListener("blur", () => {
-    setCameraInteractionMode(false);
+    cancelRollInteraction();
+    syncCameraInteractionMode();
   });
 }
 
@@ -367,11 +373,11 @@ function updateSceneFromCloud(payload, options = {}) {
   }
   pointCloudObject = new THREE.Points(geometry, material);
   state.cloudScale = computeCloudScale(payload.bounds);
-  state.pointBaseSize = Math.max(state.cloudScale * 0.018, 0.02);
+  state.pointBaseSize = Math.max(state.cloudScale * POINT_SIZE_BASE_MULTIPLIER, POINT_SIZE_MIN_WORLD);
   updatePointCloudSize();
   scene.add(pointCloudObject);
 
-  raycaster.params.Points.threshold = Math.max(state.cloudScale * 0.06, 0.04);
+  updatePointSnapThreshold();
   state.bounds = payload.bounds;
   updateHelpers(payload.bounds);
   updateSelectedMarkers(state.meta.selectedPoints || []);
@@ -448,11 +454,11 @@ function buildMarkerGroup() {
   const radius = MARKER_BASE_RADIUS;
   const sphere = new THREE.Mesh(
     new THREE.SphereGeometry(radius, 20, 20),
-    new THREE.MeshStandardMaterial({ color: 0xff9663, emissive: 0x52230d, roughness: 0.2, metalness: 0.1 }),
+    new THREE.MeshStandardMaterial({ color: 0xff2a2a, emissive: 0x5a0000, roughness: 0.2, metalness: 0.08 }),
   );
   group.add(sphere);
 
-  const crossMaterial = new THREE.LineBasicMaterial({ color: 0xffd0b2 });
+  const crossMaterial = new THREE.LineBasicMaterial({ color: 0xff7a7a });
   const crossPoints = [
     new THREE.Vector3(-radius * 2.2, 0, 0),
     new THREE.Vector3(radius * 2.2, 0, 0),
@@ -536,6 +542,88 @@ function onPointerMove(event) {
       setMarkerPosition(target.position, target.intensity);
     }
   }
+}
+
+function handleViewportPointerDown(event) {
+  if (shouldStartRollInteraction(event)) {
+    startRollInteraction(event);
+    return;
+  }
+  syncCameraInteractionMode(event);
+}
+
+function shouldStartRollInteraction(event) {
+  return controls.enabled && event.button === 0 && event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey;
+}
+
+function startRollInteraction(event) {
+  state.rollInteraction = {
+    pointerId: event.pointerId,
+    lastAngle: getRollAngle(event),
+  };
+  renderer.domElement.ownerDocument.addEventListener("pointermove", onRollPointerMove, true);
+  renderer.domElement.ownerDocument.addEventListener("pointerup", onRollPointerUp, true);
+  renderer.domElement.ownerDocument.addEventListener("pointercancel", onRollPointerUp, true);
+  event.preventDefault();
+  event.stopImmediatePropagation();
+}
+
+function onRollPointerMove(event) {
+  if (!state.rollInteraction || event.pointerId !== state.rollInteraction.pointerId) {
+    return;
+  }
+  const angle = getRollAngle(event);
+  const delta = normalizeAngleDelta(angle - state.rollInteraction.lastAngle);
+  if (Math.abs(delta) > 1e-6) {
+    applyCameraRoll(delta);
+    state.rollInteraction.lastAngle = angle;
+  }
+  event.preventDefault();
+  event.stopImmediatePropagation();
+}
+
+function onRollPointerUp(event) {
+  if (!state.rollInteraction || event.pointerId !== state.rollInteraction.pointerId) {
+    return;
+  }
+  cancelRollInteraction();
+  syncCameraInteractionMode(event);
+  event.preventDefault();
+  event.stopImmediatePropagation();
+}
+
+function cancelRollInteraction() {
+  if (!state.rollInteraction) {
+    return;
+  }
+  state.rollInteraction = null;
+  renderer.domElement.ownerDocument.removeEventListener("pointermove", onRollPointerMove, true);
+  renderer.domElement.ownerDocument.removeEventListener("pointerup", onRollPointerUp, true);
+  renderer.domElement.ownerDocument.removeEventListener("pointercancel", onRollPointerUp, true);
+}
+
+function getRollAngle(event) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  const centerX = rect.left + rect.width / 2;
+  const centerY = rect.top + rect.height / 2;
+  return Math.atan2(centerY - event.clientY, event.clientX - centerX);
+}
+
+function normalizeAngleDelta(angle) {
+  if (angle > Math.PI) {
+    return angle - Math.PI * 2;
+  }
+  if (angle < -Math.PI) {
+    return angle + Math.PI * 2;
+  }
+  return angle;
+}
+
+function applyCameraRoll(angle) {
+  tmpVector.copy(controls.target).sub(camera.position).normalize();
+  tmpQuaternion.setFromAxisAngle(tmpVector, angle);
+  camera.up.applyQuaternion(tmpQuaternion).normalize();
+  controls.update();
 }
 
 function updatePointerNdc(event) {
@@ -633,6 +721,7 @@ function computeCursorWorldTarget() {
   if (state.lockedAxes.size >= 3) {
     return { position: markerGroup.position.clone(), intensity: state.markerIntensity };
   }
+  updatePointSnapThreshold();
   raycaster.setFromCamera(pointerNdc, camera);
 
   const snappedPoint = trySnapToPoint();
@@ -670,6 +759,19 @@ function trySnapToPoint() {
     position: new THREE.Vector3(position.getX(index), position.getY(index), position.getZ(index)),
     intensity: Number.isFinite(intensity) ? intensity : null,
   };
+}
+
+function updatePointSnapThreshold() {
+  if (!pointCloudObject) {
+    return;
+  }
+  const viewportHeight = Math.max(renderer.domElement.clientHeight, 1);
+  const cameraDistance = Math.max(camera.position.distanceTo(controls.target), 1e-6);
+  const worldPerPixel =
+    2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) * cameraDistance / viewportHeight;
+  const minThreshold = Math.max(state.cloudScale * 0.0005, 0.001);
+  const maxThreshold = Math.max(state.cloudScale * 0.02, minThreshold);
+  raycaster.params.Points.threshold = THREE.MathUtils.clamp(worldPerPixel * 8, minThreshold, maxThreshold);
 }
 
 function getActivePlane() {
@@ -790,6 +892,13 @@ function updatePointCloudSize() {
     return;
   }
   pointCloudObject.material.size = state.pointBaseSize * state.pointSizeScale;
+  updateMarkerSize();
+}
+
+function updateMarkerSize() {
+  const markerRadius = state.pointBaseSize * state.pointSizeScale * MARKER_SIZE_MULTIPLIER;
+  const scale = markerRadius / MARKER_BASE_RADIUS;
+  markerGroup.scale.setScalar(scale);
 }
 
 function updatePointSizeUi() {
@@ -834,10 +943,11 @@ function buildIntensityColors(intensities) {
   return colors;
 }
 
-function setCameraInteractionMode(shiftPressed) {
-  controls.mouseButtons.LEFT = shiftPressed ? THREE.MOUSE.PAN : THREE.MOUSE.ROTATE;
-  controls.mouseButtons.MIDDLE = THREE.MOUSE.DOLLY;
-  controls.mouseButtons.RIGHT = THREE.MOUSE.PAN;
+function syncCameraInteractionMode(event = null) {
+  const modifierPressed = Boolean(event?.ctrlKey || event?.metaKey);
+  controls.mouseButtons.LEFT = modifierPressed ? THREE.MOUSE.PAN : THREE.MOUSE.ROTATE;
+  controls.mouseButtons.MIDDLE = THREE.MOUSE.PAN;
+  controls.mouseButtons.RIGHT = null;
 }
 
 function projectPointToLine(point, line) {

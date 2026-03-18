@@ -250,7 +250,7 @@ input {
 }
 
 .swatch.marker {
-  background: var(--accent);
+  background: #ff2a2a;
 }
 
 .swatch.selected {
